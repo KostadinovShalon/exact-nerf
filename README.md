@@ -5,7 +5,7 @@ This repository contains the code release of [Exact-NeRF: An Exploration of a Pr
 accepted at [CVPR 2023](https://cvpr2023.thecvf.com/). This is a fork of [MultiNeRF](https://github.com/google-research/multinerf),
 having the same usage instructions.
 
-![exact-nerf](imgs/repo-cover.png "Exact-NeRF")
+![exact-nerf](imgs/repo-cover.jpg "Exact-NeRF")
 
 ## Setup
 Please refer to the setup instructions of [MultiNeRF](https://github.com/google-research/multinerf)
