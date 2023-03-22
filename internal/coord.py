@@ -18,12 +18,12 @@ import jax
 import jax.numpy as jnp
 
 
-def contract(x):
+def contract(x, xnp=jnp):
   """Contracts points towards the origin (Eq 10 of arxiv.org/abs/2111.12077)."""
-  eps = jnp.finfo(jnp.float32).eps
+  eps = xnp.finfo(jnp.float64).eps
   # Clamping to eps prevents non-finite gradients when x == 0.
-  x_mag_sq = jnp.maximum(eps, jnp.sum(x**2, axis=-1, keepdims=True))
-  z = jnp.where(x_mag_sq <= 1, x, ((2 * jnp.sqrt(x_mag_sq) - 1) / x_mag_sq) * x)
+  x_mag_sq = xnp.maximum(eps, xnp.sum(x**2, axis=-1, keepdims=True))
+  z = xnp.where(x_mag_sq <= 1, x, ((2 * xnp.sqrt(x_mag_sq) - 1) / x_mag_sq) * x)
   return z
 
 
@@ -145,3 +145,133 @@ def pos_enc(x, min_deg, max_deg, append_identity=True):
     return jnp.concatenate([x] + [four_feat], axis=-1)
   else:
     return four_feat
+
+
+def exact_ipe(tdist, origins, tr, tl, bl, br, min_deg, max_deg, warp_fn):
+  """ Encodes a pyramidal frustum using the Exact Integrated Positional Encoding
+  Args:
+    tdist (array): sampled distances (* x N tensor)
+    origins (array): pyramid origin vectors (* x 3 tensor)
+    tr (array): top-right pixel corners (* x 3 tensor)
+    tl (array): top-left pixel corners (* x 3 tensor)
+    bl (array): bottom-left pixel corners (* x 3 tensor)
+    br (array): bottom-right pixel corners (* x 3 tensor)
+    min_deg (int): min scale value
+    max_deg (int): max scale value
+    warp_fn (callable): transformation function to warp the vertices of the frustums
+
+  Returns:
+  """
+  # tdist: ... x N
+  # rotations: ... x 3 x 3
+  # origins: ... x 3
+  # directions: ... x 3
+  # imageplane: ... x 2
+  # widths: ... x 1
+  # min_deg, max_deg: int
+  # focal_length: B x 1
+  # warp_fn: Callback
+  dtype = jnp.float64
+  tdist = jnp.array(tdist, dtype=dtype)
+  tr = jnp.array(tr, dtype=dtype)  # * rescaling
+  tl = jnp.array(tl, dtype=dtype)  # * rescaling
+  bl = jnp.array(bl, dtype=dtype)  # * rescaling
+  br = jnp.array(br, dtype=dtype)  # * rescaling
+  origins = jnp.array(origins, dtype=dtype)  # * rescaling
+
+  # Getting vertices
+  corners = jnp.stack([tr, tl, bl, br], axis=-2)  # ... x 4 x 3
+
+  # Aligning the faces to the viewing direction
+  corners = corners[..., None, :, :] * tdist[..., None, None] + origins[..., None, None, :]  # ... x N x 4 x 3
+
+  if warp_fn is not None:
+      corners = warp_fn(corners)
+
+  # Counter-clockwise indexing of the faces of the polyhedra
+  face_index = jnp.array([[0, 0, 0, 0],
+                          [1, 1, 1, 1],
+                          [0, 0, 1, 1],
+                          [0, 1, 1, 0],
+                          [0, 1, 1, 0],
+                          [0, 1, 1, 0]])
+  face_index = jnp.stack([face_index + t for t in range(tdist.shape[-1] - 1)], axis=0)  # N - 1 x 6 x 4
+  vertex_indices = jnp.array([[0, 1, 2, 3],
+                              [0, 3, 2, 1],
+                              [0, 3, 3, 0],
+                              [0, 0, 1, 1],
+                              [1, 1, 2, 2],
+                              [2, 2, 3, 3]])  # 6 x 4
+  face_index = jnp.concatenate([face_index, jnp.roll(face_index, -2, axis=-1)], axis=1)[..., :3]  # N-1 x 12 x 3
+  triangles = jnp.concatenate([vertex_indices, jnp.roll(vertex_indices, -2, axis=-1)], axis=0)[:, :3]  # 12 x 3
+
+  vertices = corners[..., face_index, triangles, :]  # ... x N-1 x 12 x 3 x 3  row vectors
+
+  #Edges of triangles
+  x0, x1, x2 = vertices[..., 0, :], vertices[..., 1, :], vertices[..., 2, :]
+  e1 = (x1 - x0)  # ... x N-1 x 12 x 3
+  e2 = (x2 - x0)
+  e3 = (x2 - x1)
+
+  scales = jnp.array([2 ** i for i in range(min_deg, max_deg)])  # L
+  _scales = 1 / scales
+  _s3 = jnp.power(_scales, 3)
+
+  cross_e = jnp.cross(e1, e2)  # # ... x N-1 x 12 x 3
+  volumes = jnp.absolute(jnp.sum(cross_e * vertices[..., 0, :], axis=(-1, -2))[..., None, None]) / 6  # x N-1 x 1 x 1
+
+  c = jnp.cos(scales[:, None, None] * vertices[..., None, :, :])  # ... x N-1 x 12 x L x 3 x 3 row vectors
+  s = jnp.sin(scales[:, None, None] * vertices[..., None, :, :])  # ... x N-1 x 12 x L x 3 x 3 row vectors
+
+  cross_e = cross_e[..., None, :]
+  e1, e2, e3 = e1[..., None, :], e2[..., None, :], e3[..., None, :]
+
+  _e1, _e2, _e3 = 1 / e1, 1 / e2, 1 / e3
+  c = _e1 * _e2 * c[..., 0, :] - _e1 * _e3 * c[..., 1, :] + _e2 * _e3 * c[..., 2, :]  # ... x N-1 x 12 x L x 3
+  s = _e1 * _e2 * s[..., 0, :] - _e1 * _e3 * s[..., 1, :] + _e2 * _e3 * s[..., 2, :]  # ... x N-1 x 12 x L x 3
+
+  # l'Hopital's rule
+  e1_to0_sin = (- jnp.cos(scales[:, None] * vertices[..., 0:1, :])
+            + scales[:, None] * e2 * jnp.sin(scales[:, None] * vertices[..., 0:1, :])
+            + jnp.cos(scales[:, None] * vertices[..., 2:3, :])) / (e2) ** 2
+  e2_to0_sin = -(jnp.cos(scales[:, None] * vertices[..., 0:1, :])
+             - scales[:, None] * e1 * jnp.sin(scales[:, None] * vertices[..., 0:1, :])
+             - jnp.cos(scales[:, None] * vertices[..., 1:2, :])) / (e1) ** 2
+  e3_to0_sin = (jnp.cos(scales[:, None] * vertices[..., 0:1, :])
+             - scales[:, None] * e1 * jnp.sin(scales[:, None] * vertices[..., 1:2, :])
+             - jnp.cos(scales[:, None] * vertices[..., 1:2, :])) / (e1) ** 2
+  all0_sin = - scales[:, None] ** 2 * jnp.cos(scales[:, None] * vertices[..., 1:2, :]) / 2
+
+  e1_to0_cos = (- jnp.sin(scales[:, None] * vertices[..., 0:1, :])
+                - scales[:, None] * e2 * jnp.cos(scales[:, None] * vertices[..., 0:1, :])
+                + jnp.sin(scales[:, None] * vertices[..., 2:3, :])) / e2 ** 2
+  e2_to0_cos = - (jnp.sin(scales[:, None] * vertices[..., 0:1, :])
+                 + scales[:, None] * e1 * jnp.cos(scales[:, None] * vertices[..., :1, :])
+                 - jnp.sin(scales[:, None] * vertices[..., 1:2, :])) / (e1) ** 2
+  e3_to0_cos = (jnp.sin(scales[:, None] * vertices[..., 0:1, :])
+                + scales[:, None] * e1 * jnp.cos(scales[:, None] * vertices[..., 1:2, :])
+                - jnp.sin(scales[:, None] * vertices[..., 1:2, :])) / (e1) ** 2
+  all0_cos = - scales[:, None] ** 2 * jnp.sin(scales[:, None] * vertices[..., 1:2, :]) / 2
+
+  sv = _s3[..., None] / volumes
+
+  c = jnp.where(jnp.abs(e1) < 1e-6, e1_to0_sin, c)
+  c = jnp.where(jnp.abs(e2) < 1e-6, e2_to0_sin, c)
+  c = jnp.where(jnp.abs(e3) < 1e-6, e3_to0_sin, c)
+  c = jnp.where(jnp.bitwise_and(jnp.abs(e2) < 1e-6, jnp.abs(e1)<1e-6), all0_sin, c)
+  c = jnp.where(jnp.bitwise_and(jnp.abs(e3) < 1e-6, jnp.abs(e1) < 1e-6), all0_sin, c)
+  c = jnp.where(jnp.bitwise_and(jnp.abs(e2) < 1e-6, jnp.abs(e3) < 1e-6), all0_sin, c)
+
+  c = sv * jnp.sum(cross_e * c, axis=-3)
+
+  s = jnp.where(jnp.abs(e1) < 1e-6, e1_to0_cos, s)
+  s = jnp.where(jnp.abs(e2) < 1e-6, e2_to0_cos, s)
+  s = jnp.where(jnp.abs(e3) < 1e-6, e3_to0_cos, s)
+  s = jnp.where(jnp.bitwise_and(jnp.abs(e2) < 1e-6, jnp.abs(e1)<1e-6), all0_cos, s)
+  s = jnp.where(jnp.bitwise_and(jnp.abs(e3) < 1e-6, jnp.abs(e1) < 1e-6), all0_cos, s)
+  s = jnp.where(jnp.bitwise_and(jnp.abs(e2) < 1e-6, jnp.abs(e3) < 1e-6), all0_cos, s)
+  s = sv * jnp.sum(cross_e * s, axis=-3)
+
+  eipe = jnp.concatenate([c, -s], axis=-2)
+  eipe = jnp.reshape(eipe, eipe.shape[:-2] + (-1,))  # ... x N-1 x 6L
+  return eipe

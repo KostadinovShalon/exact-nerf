@@ -1,0 +1,29 @@
+Config.dataset_loader = 'blender'
+Config.batching = 'single_image'
+Config.near = 2
+Config.far = 6
+Config.eval_render_interval = 5
+Config.data_loss_type = 'mse'
+Config.adam_eps = 1e-8
+
+Model.num_levels = 2
+Model.num_prop_samples = 128
+Model.num_nerf_samples = 32
+
+ExactPropMLP.net_depth = 4
+ExactPropMLP.net_width = 256
+ExactPropMLP.basis_shape = 'octahedron'
+ExactPropMLP.basis_subdivisions = 1
+ExactPropMLP.disable_density_normals = True
+ExactPropMLP.disable_rgb = True
+
+ExactNerfMLP.net_depth = 8
+ExactNerfMLP.net_width = 256
+ExactNerfMLP.basis_shape = 'octahedron'
+ExactNerfMLP.basis_subdivisions = 1
+ExactNerfMLP.disable_density_normals = True
+
+Config.distortion_loss_mult = 0.
+
+ExactNerfMLP.max_deg_point = 16
+ExactPropMLP.max_deg_point = 16

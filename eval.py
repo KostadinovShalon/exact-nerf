@@ -40,6 +40,13 @@ import numpy as np
 configs.define_common_flags()
 jax.config.parse_flags_with_absl()
 
+# import os
+# os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] ='false'
+# os.environ['XLA_PYTHON_CLIENT_ALLOCATOR']='platform'
+# os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+from jax.config import config
+config.update("jax_enable_x64", True)
+
 
 def main(unused_argv):
   config = configs.load_config(save_config=False)

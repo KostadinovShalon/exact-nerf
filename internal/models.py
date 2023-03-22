@@ -84,7 +84,7 @@ class Model(nn.Module):
 
     Args:
       rng: random number generator (or None for deterministic output).
-      rays: util.Rays, a pytree of ray origins, directions, and viewdirs.
+      rays: Union[util.Rays, util.Pyramids], a pytree of ray origins, 0, and viewdirs.
       train_frac: float in [0, 1], what fraction of training is complete.
       compute_extras: bool, if True, compute extra quantities besides color.
       zero_glo: bool, if True, when using GLO pass in vector of zeros.
@@ -95,8 +95,8 @@ class Model(nn.Module):
 
     # Construct MLPs. WARNING: Construction order may matter, if MLP weights are
     # being regularized.
-    nerf_mlp = NerfMLP()
-    prop_mlp = nerf_mlp if self.single_mlp else PropMLP()
+    nerf_mlp = ExactNerfMLP() if self.config.pyramid else NerfMLP()
+    prop_mlp = nerf_mlp if self.single_mlp else (ExactPropMLP() if self.config.pyramid else PropMLP())
 
     if self.num_glo_features > 0:
       if not zero_glo:
@@ -203,31 +203,47 @@ class Model(nn.Module):
       # Convert normalized distances to metric distances.
       tdist = s_to_t(sdist)
 
-      # Cast our rays, by turning our distance intervals into Gaussians.
-      gaussians = render.cast_rays(
-          tdist,
-          rays.origins,
-          rays.directions,
-          rays.radii,
-          self.ray_shape,
-          diag=False)
-
-      if self.disable_integration:
-        # Setting the covariance of our Gaussian samples to 0 disables the
-        # "integrated" part of integrated positional encoding.
-        gaussians = (gaussians[0], jnp.zeros_like(gaussians[1]))
-
       # Push our Gaussians through one of our two MLPs.
       mlp = prop_mlp if is_prop else nerf_mlp
       key, rng = random_split(rng)
-      ray_results = mlp(
-          key,
-          gaussians,
-          viewdirs=rays.viewdirs if self.use_viewdirs else None,
-          imageplane=rays.imageplane,
-          glo_vec=None if is_prop else glo_vec,
-          exposure=rays.exposure_values,
-      )
+
+      if not self.config.pyramid:
+        gaussians = render.cast_rays(
+            tdist,
+            rays.origins,
+            rays.directions,
+            rays.radii,
+            self.ray_shape,
+            diag=False)
+
+        if self.disable_integration:
+          # Setting the covariance of our Gaussian samples to 0 disables the
+          # "integrated" part of integrated positional encoding.
+          gaussians = (gaussians[0], jnp.zeros_like(gaussians[1]))
+
+        ray_results = mlp(
+            key,
+            gaussians,
+            viewdirs=rays.viewdirs if self.use_viewdirs else None,
+            imageplane=rays.imageplane,
+            glo_vec=None if is_prop else glo_vec,
+            exposure=rays.exposure_values,
+        )
+      else:
+          ray_results = mlp(
+              key,
+              tdist,
+              rays.origins,
+              rays.directions,
+              rays.tr,
+              rays.tl,
+              rays.bl,
+              rays.br,
+              viewdirs=rays.viewdirs if self.use_viewdirs else None,
+              imageplane=rays.imageplane,
+              glo_vec=None if is_prop else glo_vec,
+              exposure=rays.exposure_values,
+          )
 
       # Get the weights used by volumetric rendering (and our other losses).
       weights = render.compute_alpha_weights(
@@ -449,6 +465,7 @@ class MLP(nn.Module):
           coord.lift_and_diagonalize(means, covs, self.pos_basis_t))
       x = coord.integrated_pos_enc(lifted_means, lifted_vars,
                                    self.min_deg_point, self.max_deg_point)
+      x = jnp.array(x, dtype=jnp.float32)  # Transforms back to float32
 
       inputs = x
       # Evaluate network to produce the output density.
@@ -612,6 +629,224 @@ class MLP(nn.Module):
     )
 
 
+class ExactMLP(MLP):
+
+    @nn.compact
+    def __call__(self,
+                 rng,
+                 tvals,
+                 origins,
+                 directions,
+                 tr,
+                 tl,
+                 bl,
+                 br,
+                 viewdirs=None,
+                 imageplane=None,
+                 glo_vec=None,
+                 exposure=None):
+        """Evaluate the MLP.
+
+        Args:
+          rng: jnp.ndarray. Random number generator.
+          tvals: [..., n], TODO: doc
+          rotations: jnp.ndarray(float32), [..., 3, 3], TODO: doc
+          origins: jnp.ndarray(float32), [..., 3], TODO: doc
+          viewdirs: jnp.ndarray(float32), [..., 3], if not None, this variable will
+            be part of the input to the second part of the MLP concatenated with the
+            output vector of the first part of the MLP. If None, only the first part
+            of the MLP will be used with input x. In the original paper, this
+            variable is the view direction.
+          imageplane: jnp.ndarray(float32), [batch, 2], xy image plane coordinates
+            for each ray in the batch. Useful for image plane operations such as a
+            learned vignette mapping.
+          glo_vec: [..., num_glo_features], The GLO vector for each ray.
+          exposure: [..., 1], exposure value (shutter_speed * ISO) for each ray.
+
+        Returns:
+          rgb: jnp.ndarray(float32), with a shape of [..., num_rgb_channels].
+          density: jnp.ndarray(float32), with a shape of [...].
+          normals: jnp.ndarray(float32), with a shape of [..., 3], or None.
+          normals_pred: jnp.ndarray(float32), with a shape of [..., 3], or None.
+          roughness: jnp.ndarray(float32), with a shape of [..., 1], or None.
+        """
+
+        dense_layer = functools.partial(
+            nn.Dense, kernel_init=getattr(jax.nn.initializers, self.weight_init)())
+
+        density_key, rng = random_split(rng)
+
+        def predict_density(tdists):
+            """Helper function to output density."""
+            # Encode input positions
+            x = coord.exact_ipe(
+                tdists, origins, tr, tl, bl, br, self.min_deg_point,
+                self.max_deg_point, self.warp_fn)
+            x = jnp.array(x, dtype=jnp.float32)  # Converting again to float32
+
+            inputs = x
+            # Evaluate network to produce the output density.
+            for i in range(self.net_depth):
+                x = dense_layer(self.net_width)(x)
+                x = self.net_activation(x)
+                if i % self.skip_layer == 0 and i > 0:
+                    x = jnp.concatenate([x, inputs], axis=-1)
+            raw_density = dense_layer(1)(x)[..., 0]  # Hardcoded to a single channel.
+            # Add noise to regularize the density predictions if needed.
+            if (density_key is not None) and (self.density_noise > 0):
+                raw_density += self.density_noise * random.normal(
+                    density_key, raw_density.shape)
+            return raw_density, x
+
+        if self.disable_density_normals:
+            raw_density, x = predict_density(tvals)
+            raw_grad_density = None
+            normals = None
+        else:
+            raise NotImplementedError("Density normals have not been implemented yet")
+            # # Flatten the input so value_and_grad can be vmap'ed.
+            # means_flat = means.reshape((-1, means.shape[-1]))
+            # covs_flat = covs.reshape((-1,) + covs.shape[len(means.shape) - 1:])
+            #
+            # # Evaluate the network and its gradient on the flattened input.
+            # predict_density_and_grad_fn = jax.vmap(
+            #     jax.value_and_grad(predict_density, has_aux=True), in_axes=(0, 0))
+            # (raw_density_flat, x_flat), raw_grad_density_flat = (
+            #     predict_density_and_grad_fn(means_flat, covs_flat))
+            #
+            # # Unflatten the output.
+            # raw_density = raw_density_flat.reshape(means.shape[:-1])
+            # x = x_flat.reshape(means.shape[:-1] + (x_flat.shape[-1],))
+            # raw_grad_density = raw_grad_density_flat.reshape(means.shape)
+            #
+            # # Compute normal vectors as negative normalized density gradient.
+            # # We normalize the gradient of raw (pre-activation) density because
+            # # it's the same as post-activation density, but is more numerically stable
+            # # when the activation function has a steep or flat gradient.
+            # normals = -ref_utils.l2_normalize(raw_grad_density)
+
+        if self.enable_pred_normals:
+            raise NotImplementedError("Enabled pred normals is not implemented yet")
+            # grad_pred = dense_layer(3)(x)
+            #
+            # # Normalize negative predicted gradients to get predicted normal vectors.
+            # normals_pred = -ref_utils.l2_normalize(grad_pred)
+            # normals_to_use = normals_pred
+        else:
+            grad_pred = None
+            normals_pred = None
+            normals_to_use = normals
+
+        # Apply bias and activation to raw density
+        density = self.density_activation(raw_density + self.density_bias)
+
+        roughness = None
+        if self.disable_rgb:
+            rgb = jnp.zeros(raw_density.shape + (3,))
+        else:
+            if viewdirs is not None:
+                # Predict diffuse color.
+                if self.use_diffuse_color:
+                    raw_rgb_diffuse = dense_layer(self.num_rgb_channels)(x)
+
+                if self.use_specular_tint:
+                    tint = nn.sigmoid(dense_layer(3)(x))
+
+                if self.enable_pred_roughness:
+                    raw_roughness = dense_layer(1)(x)
+                    roughness = (
+                        self.roughness_activation(raw_roughness + self.roughness_bias))
+
+                # Output of the first part of MLP.
+                if self.bottleneck_width > 0:
+                    bottleneck = dense_layer(self.bottleneck_width)(x)
+
+                    # Add bottleneck noise.
+                    if (rng is not None) and (self.bottleneck_noise > 0):
+                        key, rng = random_split(rng)
+                        bottleneck += self.bottleneck_noise * random.normal(
+                            key, bottleneck.shape)
+
+                    x = [bottleneck]
+                else:
+                    x = []
+
+                # Encode view (or reflection) directions.
+                if self.use_reflections:
+                    # Compute reflection directions. Note that we flip viewdirs before
+                    # reflecting, because they point from the camera to the point,
+                    # whereas ref_utils.reflect() assumes they point toward the camera.
+                    # Returned refdirs then point from the point to the environment.
+                    refdirs = ref_utils.reflect(-viewdirs[..., None, :], normals_to_use)
+                    # Encode reflection directions.
+                    dir_enc = self.dir_enc_fn(refdirs, roughness)
+                else:
+                    # Encode view directions.
+                    dir_enc = self.dir_enc_fn(viewdirs, roughness)
+
+                    dir_enc = jnp.broadcast_to(
+                        dir_enc[..., None, :],
+                        bottleneck.shape[:-1] + (dir_enc.shape[-1],))
+
+                # Append view (or reflection) direction encoding to bottleneck vector.
+                x.append(dir_enc)
+
+                # Append dot product between normal vectors and view directions.
+                if self.use_n_dot_v:
+                    dotprod = jnp.sum(
+                        normals_to_use * viewdirs[..., None, :], axis=-1, keepdims=True)
+                    x.append(dotprod)
+
+                # Append GLO vector if used.
+                if glo_vec is not None:
+                    glo_vec = jnp.broadcast_to(glo_vec[..., None, :],
+                                               bottleneck.shape[:-1] + glo_vec.shape[-1:])
+                    x.append(glo_vec)
+
+                # Concatenate bottleneck, directional encoding, and GLO.
+                x = jnp.concatenate(x, axis=-1)
+
+                # Output of the second part of MLP.
+                inputs = x
+                for i in range(self.net_depth_viewdirs):
+                    x = dense_layer(self.net_width_viewdirs)(x)
+                    x = self.net_activation(x)
+                    if i % self.skip_layer_dir == 0 and i > 0:
+                        x = jnp.concatenate([x, inputs], axis=-1)
+
+            # If using diffuse/specular colors, then `rgb` is treated as linear
+            # specular color. Otherwise it's treated as the color itself.
+            rgb = self.rgb_activation(self.rgb_premultiplier *
+                                      dense_layer(self.num_rgb_channels)(x) +
+                                      self.rgb_bias)
+
+            if self.use_diffuse_color:
+                # Initialize linear diffuse color around 0.25, so that the combined
+                # linear color is initialized around 0.5.
+                diffuse_linear = nn.sigmoid(raw_rgb_diffuse - jnp.log(3.0))
+                if self.use_specular_tint:
+                    specular_linear = tint * rgb
+                else:
+                    specular_linear = 0.5 * rgb
+
+                # Combine specular and diffuse components and tone map to sRGB.
+                rgb = jnp.clip(
+                    image.linear_to_srgb(specular_linear + diffuse_linear), 0.0, 1.0)
+
+            # Apply padding, mapping color to [-rgb_padding, 1+rgb_padding].
+            rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+
+        return dict(
+            density=density,
+            rgb=rgb,
+            raw_grad_density=raw_grad_density,
+            grad_pred=grad_pred,
+            normals=normals,
+            normals_pred=normals_pred,
+            roughness=roughness,
+        )
+
+
 @gin.configurable
 class NerfMLP(MLP):
   pass
@@ -619,6 +854,16 @@ class NerfMLP(MLP):
 
 @gin.configurable
 class PropMLP(MLP):
+  pass
+
+
+@gin.configurable
+class ExactNerfMLP(ExactMLP):
+  pass
+
+
+@gin.configurable
+class ExactPropMLP(ExactMLP):
   pass
 
 

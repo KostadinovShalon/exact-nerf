@@ -164,6 +164,9 @@ class Config:
   # For raw test scenes, use affine raw-space color correction.
   eval_raw_affine_cc: bool = False
 
+  # pmip
+  pyramid: bool = False  # Indicates if the pyramid parameterization must be used
+
 
 def define_common_flags():
   # Define the flags used by both train.py and eval.py

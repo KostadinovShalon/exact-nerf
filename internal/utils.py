@@ -57,15 +57,50 @@ class Rays:
   exposure_values: Optional[_Array] = None
 
 
+@flax.struct.dataclass
+class Pyramids:
+  """All tensors must have the same num_dims and first n-1 dims must match."""
+  origins: _Array
+  directions: _Array
+  tr: _Array
+  tl: _Array
+  bl: _Array
+  br: _Array
+  viewdirs: _Array
+  imageplane: _Array
+  lossmult: _Array
+  near: _Array
+  far: _Array
+  cam_idx: _Array
+  exposure_idx: Optional[_Array] = None
+  exposure_values: Optional[_Array] = None
+
+
 # Dummy Rays object that can be used to initialize NeRF model.
 def dummy_rays(include_exposure_idx: bool = False,
-               include_exposure_values: bool = False) -> Rays:
+               include_exposure_values: bool = False,
+               pyramid=False) -> Union[Pyramids, Rays]:
   data_fn = lambda n: jnp.zeros((1, n))
   exposure_kwargs = {}
   if include_exposure_idx:
     exposure_kwargs['exposure_idx'] = data_fn(1).astype(jnp.int32)
   if include_exposure_values:
     exposure_kwargs['exposure_values'] = data_fn(1)
+  if pyramid:
+    return Pyramids(
+      origins=data_fn(3),
+      directions=data_fn(3),
+      tr=data_fn(3),
+      tl=data_fn(3),
+      bl=data_fn(3),
+      br=data_fn(3),
+      viewdirs=data_fn(3),
+      imageplane=data_fn(2),
+      lossmult=data_fn(1),
+      near=data_fn(1),
+      far=data_fn(1),
+      cam_idx=data_fn(1).astype(jnp.int32),
+      **exposure_kwargs)
   return Rays(
       origins=data_fn(3),
       directions=data_fn(3),

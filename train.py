@@ -40,6 +40,13 @@ jax.config.parse_flags_with_absl()
 
 TIME_PRECISION = 1000  # Internally represent integer times in milliseconds.
 
+# Related to JAX issue #4920 https://github.com/google/jax/issues/4920#issuecomment-1161227026
+# import os
+# os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] ='false'
+# os.environ['XLA_PYTHON_CLIENT_ALLOCATOR']='platform'
+# os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+from jax.config import config
+config.update("jax_enable_x64", True)
 
 def main(unused_argv):
   rng = random.PRNGKey(20200823)

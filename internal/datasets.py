@@ -290,6 +290,8 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
     self.pixtocams: np.ndarray = None
     self.height: int = None
     self.width: int = None
+    # Exact-NeRF
+    self.use_pyramids: bool = config.pyramid
 
     # Load data from disk using provided config parameters.
     self._load_renderings(config)
@@ -434,7 +436,7 @@ class Dataset(threading.Thread, metaclass=abc.ABCMeta):
     else:
       # Slow path, do ray computation using numpy (on CPU).
       rays = camera_utils.cast_ray_batch(
-          self.cameras, pixels, self.camtype, xnp=np)
+          self.cameras, pixels, self.camtype, xnp=np, pyramid=self.use_pyramids)
 
     # Create data batch.
     batch = {}

@@ -526,7 +526,7 @@ def pixels_to_rays(
     pixtocam_ndc: Optional[_Array] = None,
     camtype: ProjectionType = ProjectionType.PERSPECTIVE,
     xnp: types.ModuleType = np,
-) -> Tuple[_Array, _Array, _Array, _Array, _Array]:
+) -> Tuple[_Array, _Array, _Array, _Array, _Array, _Array, _Array, _Array, _Array]:
   """Calculates rays given pixel coordinates, intrinisics, and extrinsics.
 
   Given 2D pixel coordinates pix_x_int, pix_y_int for cameras with
@@ -555,6 +555,11 @@ def pixels_to_rays(
       If the image plane is at world space distance 1 from the pinhole, then
       imageplane will be the xy coordinates of a pixel in that space (so the
       camera ray direction at the origin would be (x, y, -1) in OpenGL coords).
+    NEW for Exact-NeRF
+    tr: float array, shape SH + [3], top right ray vector
+    tl: float array, shape SH + [3], top left ray vector
+    bl: float array, shape SH + [3], bottom left ray vector
+    br: float array, shape SH + [3], bottom right ray vector
   """
   # Must add half pixel offset to shoot rays through pixel centers.
   def pix_to_dir(x, y):
@@ -563,7 +568,11 @@ def pixels_to_rays(
   pixel_dirs_stacked = xnp.stack([
       pix_to_dir(pix_x_int, pix_y_int),
       pix_to_dir(pix_x_int + 1, pix_y_int),
-      pix_to_dir(pix_x_int, pix_y_int + 1)
+      pix_to_dir(pix_x_int, pix_y_int + 1),
+      pix_to_dir(pix_x_int + .5, pix_y_int + .5),  # tr
+      pix_to_dir(pix_x_int - .5, pix_y_int + .5),  # tl
+      pix_to_dir(pix_x_int - .5, pix_y_int - .5),  # bl
+      pix_to_dir(pix_x_int + .5, pix_y_int - .5)  # br
   ], axis=0)
 
   # For jax, need to specify high-precision matmul.
@@ -604,7 +613,7 @@ def pixels_to_rays(
   directions_stacked = mat_vec_mul(camtoworlds[..., :3, :3],
                                    camera_dirs_stacked)
   # Extract the offset rays.
-  directions, dx, dy = directions_stacked
+  directions, dx, dy, tr, tl, bl, br = directions_stacked
 
   origins = xnp.broadcast_to(camtoworlds[..., :3, -1], directions.shape)
   viewdirs = directions / xnp.linalg.norm(directions, axis=-1, keepdims=True)
@@ -628,14 +637,15 @@ def pixels_to_rays(
   # distribution the size of a pixel (1/12, see the original mipnerf paper).
   radii = (0.5 * (dx_norm + dy_norm))[..., None] * 2 / xnp.sqrt(12)
 
-  return origins, directions, viewdirs, radii, imageplane
+  return origins, directions, viewdirs, radii, imageplane, tr, tl, bl, br
 
 
 def cast_ray_batch(
     cameras: Tuple[_Array, ...],
     pixels: utils.Pixels,
     camtype: ProjectionType = ProjectionType.PERSPECTIVE,
-    xnp: types.ModuleType = np) -> utils.Rays:
+    xnp: types.ModuleType = np,
+    pyramid: bool = False) -> Union[utils.Rays, utils.Pyramids]:
   """Maps from input cameras and Pixel batch to output Ray batch.
 
   `cameras` is a Tuple of four sets of camera parameters.
@@ -651,6 +661,7 @@ def cast_ray_batch(
       These fields can be an arbitrary batch shape.
     camtype: camera_utils.ProjectionType, fisheye or perspective camera.
     xnp: either numpy or jax.numpy.
+    pyramid: weather to return Pyramids or Rays (cones)
 
   Returns:
     rays: Rays dataclass with computed 3D world space ray data.
@@ -662,7 +673,7 @@ def cast_ray_batch(
   batch_index = lambda arr: arr if arr.ndim == 2 else arr[cam_idx]
 
   # Compute rays from pixel coordinates.
-  origins, directions, viewdirs, radii, imageplane = pixels_to_rays(
+  origins, directions, viewdirs, radii, imageplane, tr, tl, bl, br = pixels_to_rays(
       pixels.pix_x_int,
       pixels.pix_y_int,
       batch_index(pixtocams),
@@ -673,19 +684,37 @@ def cast_ray_batch(
       xnp=xnp)
 
   # Create Rays data structure.
-  return utils.Rays(
-      origins=origins,
-      directions=directions,
-      viewdirs=viewdirs,
-      radii=radii,
-      imageplane=imageplane,
-      lossmult=pixels.lossmult,
-      near=pixels.near,
-      far=pixels.far,
-      cam_idx=pixels.cam_idx,
-      exposure_idx=pixels.exposure_idx,
-      exposure_values=pixels.exposure_values,
-  )
+  if pyramid:
+      return utils.Pyramids(
+          origins=origins,
+          directions=directions,
+          viewdirs=viewdirs,
+          imageplane=imageplane,
+          lossmult=pixels.lossmult,
+          near=pixels.near,
+          far=pixels.far,
+          tr=tr,
+          tl=tl,
+          bl=bl,
+          br=br,
+          cam_idx=pixels.cam_idx,
+          exposure_idx=pixels.exposure_idx,
+          exposure_values=pixels.exposure_values,
+      )
+  else:
+      return utils.Rays(
+          origins=origins,
+          directions=directions,
+          viewdirs=viewdirs,
+          radii=radii,
+          imageplane=imageplane,
+          lossmult=pixels.lossmult,
+          near=pixels.near,
+          far=pixels.far,
+          cam_idx=pixels.cam_idx,
+          exposure_idx=pixels.exposure_idx,
+          exposure_values=pixels.exposure_values,
+      )
 
 
 def cast_pinhole_rays(camtoworld: _Array,
@@ -701,6 +730,7 @@ def cast_pinhole_rays(camtoworld: _Array,
   pixtocam = get_pixtocam(focal, width, height, xnp=xnp)
 
   ray_args = pixels_to_rays(pix_x_int, pix_y_int, pixtocam, camtoworld, xnp=xnp)
+  ray_args = ray_args[:5]
 
   broadcast_scalar = lambda x: xnp.broadcast_to(x, pix_x_int.shape)[..., None]
   ray_kwargs = {

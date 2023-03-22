@@ -37,6 +37,9 @@ import numpy as np
 configs.define_common_flags()
 jax.config.parse_flags_with_absl()
 
+from jax.config import config
+config.update("jax_enable_x64", True)
+
 
 def create_videos(config, base_dir, out_dir, out_name, num_frames):
   """Creates videos out of the images saved to disk."""

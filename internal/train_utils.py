@@ -257,7 +257,7 @@ def create_train_step(model: models.Model,
     def loss_fn(variables):
       rays = batch.rays
       if config.cast_rays_in_train_step:
-        rays = camera_utils.cast_ray_batch(cameras, rays, camtype, xnp=jnp)
+        rays = camera_utils.cast_ray_batch(cameras, rays, camtype, xnp=jnp, pyramid=config.pyramid)
 
       # Indicates whether we need to compute output normal or depth maps in 2D.
       compute_extras = (
@@ -399,7 +399,7 @@ def setup_model(
   """Creates NeRF model, optimizer, and pmap-ed train/render functions."""
 
   dummy_rays = utils.dummy_rays(
-      include_exposure_idx=config.rawnerf_mode, include_exposure_values=True)
+      include_exposure_idx=config.rawnerf_mode, include_exposure_values=True, pyramid=config.pyramid)
   model, variables = models.construct_model(rng, dummy_rays, config)
 
   state, lr_fn = create_optimizer(config, variables)
