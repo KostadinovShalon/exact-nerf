@@ -1,7 +1,7 @@
 # Exact-NeRF
 
 This repository contains the code release of [Exact-NeRF: An Exploration of a Precise Volumetric Parameterization for Neural Radiance Fields
-](https://arxiv.org/abs/2211.12285), 
+](https://kostadinovshalon.github.io/exact-nerf/), 
 accepted at [CVPR 2023](https://cvpr2023.thecvf.com/). This is a fork of [MultiNeRF](https://github.com/google-research/multinerf),
 having the same usage instructions.
 
